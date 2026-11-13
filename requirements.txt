@@ -1,0 +1,4 @@
+google-adk>=2.0
+google-genai>=1.0
+streamlit>=1.50
+sqlparse>=0.5
