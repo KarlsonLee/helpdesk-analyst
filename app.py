@@ -31,6 +31,7 @@ import json                      # turn Python dicts into JSON text (tools retur
 import os                        # read/write environment variables (the API key)
 import re                        # regular expressions (pattern matching) for masking personal data
 import sqlite3                   # built-in lightweight database
+import tempfile                  # find the system temp folder (fallback if the app folder is read-only)
 import uuid                      # generate random IDs for chat sessions
 from datetime import date, timedelta   # work with dates (sample data + "today")
 from pathlib import Path         # easy, OS-independent file paths
@@ -74,7 +75,26 @@ if not os.environ.get("GOOGLE_API_KEY"):
 
 # File locations, all relative to this app.py so it works from any folder.
 BASE_DIR = Path(__file__).parent
-DB_FILE = BASE_DIR / "enterprise.db"            # the SQLite database file
+
+
+def _writable_folder() -> Path:
+    """Return a folder we can write to: the app folder if possible, else the system temp folder.
+
+    Some hosting platforms mount the app's code as read-only, and SQLite only notices at the
+    first write. So we test with a tiny probe file before choosing where the database lives.
+    """
+    for folder in (BASE_DIR, Path(tempfile.gettempdir())):
+        try:
+            probe = folder / f".write_test_{uuid.uuid4().hex}"
+            probe.write_text("ok")
+            probe.unlink()
+            return folder
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+DB_FILE = _writable_folder() / "enterprise.db"  # the SQLite database file
 POLICY_DIR = BASE_DIR / "policies"              # folder holding policy documents (.md files)
 GOLDEN_FILE = BASE_DIR / "capstone_golden.json" # test questions + expected answers for evaluation
 
@@ -95,7 +115,11 @@ def init_database() -> None:
     # both as text like 2026-11-05. This keeps the sample data realistic on any day you run it.
     past = lambda days: (date.today() - timedelta(days=days)).isoformat()    # noqa: E731
     future = lambda days: (date.today() + timedelta(days=days)).isoformat()  # noqa: E731
-    conn = sqlite3.connect(DB_FILE)  # normal (writable) connection - used for setup only
+    # Build the database in a temporary file first, then swap it into place at the very end.
+    # This is "atomic": if two visitors start the app at the same time, or the first start is
+    # interrupted, nobody can ever see a half-built database.
+    tmp_file = DB_FILE.with_name(f"enterprise.{uuid.uuid4().hex}.tmp")
+    conn = sqlite3.connect(tmp_file)  # normal (writable) connection - used for setup only
     # Create 4 tables. FOREIGN KEY lines link tables together
     # (e.g. every ticket points to the employee who raised it).
     conn.executescript(
@@ -179,6 +203,10 @@ def init_database() -> None:
     )
     conn.commit()  # save everything to disk
     conn.close()
+    try:
+        os.replace(tmp_file, DB_FILE)  # atomic swap: the finished database appears all at once
+    finally:
+        tmp_file.unlink(missing_ok=True)  # clean up the temp file if the swap did not happen
 
 
 def simulate_migration() -> None:
